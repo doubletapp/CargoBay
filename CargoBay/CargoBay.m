@@ -22,8 +22,7 @@
 
 #import "CargoBay.h"
 
-#import "AFHTTPRequestOperationManager.h"
-#import "AFHTTPRequestOperation.h"
+#import "AFHTTPSessionManager.h"
 
 #import <AssertMacros.h>
 
@@ -671,8 +670,8 @@ NSDictionary * CBPurchaseInfoFromTransactionReceipt(NSData *transactionReceiptDa
     return _sharedManager;
 }
 
-+ (AFHTTPRequestOperationManager *)receiptVerificationOperationManagerWithBaseURL:(NSURL *)baseURL {
-    AFHTTPRequestOperationManager *manager = [[AFHTTPRequestOperationManager alloc] initWithBaseURL:baseURL];
++ (AFHTTPSessionManager *)receiptVerificationOperationManagerWithBaseURL:(NSURL *)baseURL {
+    AFHTTPSessionManager* manager = [[AFHTTPSessionManager alloc] initWithBaseURL:baseURL];
     
     manager.requestSerializer  = [AFJSONRequestSerializer serializer];
     [manager.requestSerializer setValue:@"application/json" forHTTPHeaderField:@"Accept"];
@@ -710,27 +709,33 @@ NSDictionary * CBPurchaseInfoFromTransactionReceipt(NSData *transactionReceiptDa
                     success:(void (^)(NSArray *products, NSArray *invalidIdentifiers))success
                     failure:(void (^)(NSError *error))failure
 {
-    AFHTTPRequestOperation *requestOperation = [[AFHTTPRequestOperation alloc] initWithRequest:urlRequest];
-    requestOperation.responseSerializer = [AFJSONResponseSerializer serializer];
-    [requestOperation setCompletionBlockWithSuccess:^(__unused AFHTTPRequestOperation *operation, id JSON) {
-        if (JSON && [JSON isKindOfClass:[NSArray class]]) {
-            [self productsWithIdentifiers:[NSSet setWithArray:JSON] success:success failure:failure];
-        } else {
+    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+    AFURLSessionManager *manager = [[AFURLSessionManager alloc] initWithSessionConfiguration:configuration];
+    manager.responseSerializer = [AFJSONResponseSerializer serializer];
+    NSURLSessionDataTask* task =  [manager dataTaskWithRequest:urlRequest uploadProgress:nil downloadProgress:nil completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable JSON, NSError * _Nullable error) {
+        
+        if (error) {
             if (failure) {
-                NSDictionary *userInfo = [NSMutableDictionary dictionary];
-                [userInfo setValue:[NSString stringWithFormat:NSLocalizedStringFromTable(@"Expected array of product identifiers, got %@.", @"CargoBay", nil), JSON] forKey:NSLocalizedDescriptionKey];
-                NSError *error = [NSError errorWithDomain:CargoBayErrorDomain code:CargoBayErrorTransactionNotInPurchasedOrRestoredState userInfo:userInfo];
-                
                 failure(error);
             }
-        }
-    } failure:^(__unused AFHTTPRequestOperation *operation, NSError *error) {
-        if (failure) {
-            failure(error);
+        } else {
+            if (JSON && [JSON isKindOfClass:[NSArray class]]) {
+                [self productsWithIdentifiers:[NSSet setWithArray:JSON] success:success failure:failure];
+            } else {
+                if (failure) {
+                    NSDictionary *userInfo = [NSMutableDictionary dictionary];
+                    [userInfo setValue:[NSString stringWithFormat:NSLocalizedStringFromTable(@"Expected array of product identifiers, got %@.", @"CargoBay", nil), JSON] forKey:NSLocalizedDescriptionKey];
+                    NSError *err = [NSError errorWithDomain:CargoBayErrorDomain code:CargoBayErrorTransactionNotInPurchasedOrRestoredState userInfo:userInfo];
+                    
+                    failure(err);
+                }
+            }
         }
     }];
     
-    [self.requestOperationQueue addOperation:requestOperation];
+    [self.requestOperationQueue addOperationWithBlock:^{
+        [task resume];
+    }];
 }
 
 - (void)verifyTransaction:(SKPaymentTransaction *)transaction
@@ -798,7 +803,7 @@ NSDictionary * CBPurchaseInfoFromTransactionReceipt(NSData *transactionReceiptDa
                             failure:(void (^)(NSError *error))failure
 {
     NSURL *baseURL = [NSURL URLWithString:[[url absoluteString] substringToIndex:[[url absoluteString] rangeOfString:[url path] options:NSBackwardsSearch].location]];
-    AFHTTPRequestOperationManager *manager = [[self class] receiptVerificationOperationManagerWithBaseURL:baseURL];
+    AFHTTPSessionManager *manager = [[self class] receiptVerificationOperationManagerWithBaseURL:baseURL];
 
     NSMutableDictionary *parameters = [NSMutableDictionary dictionaryWithObject:CBBase64EncodedStringFromData(transactionReceipt) forKey:@"receipt-data"];
     if (password) {
@@ -806,105 +811,109 @@ NSDictionary * CBPurchaseInfoFromTransactionReceipt(NSData *transactionReceiptDa
     }
 
     NSURLRequest *request = [manager.requestSerializer requestWithMethod:method URLString:url.absoluteString parameters:parameters error:nil];
-    AFHTTPRequestOperation *requestOperation = [manager HTTPRequestOperationWithRequest:request success:^(__unused AFHTTPRequestOperation *operation, id responseObject) {
-        NSInteger status = [responseObject valueForKey:@"status"] ? [[responseObject valueForKey:@"status"] integerValue] : NSNotFound;
+    
+    NSURLSessionDataTask* task = [manager dataTaskWithRequest:request uploadProgress:nil downloadProgress:nil completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable responseObject, NSError * _Nullable error) {
+        if (error) {
+            if (failure) {
+                failure(error);
+            }
+        } else {
+            NSInteger status = [responseObject valueForKey:@"status"] ? [[responseObject valueForKey:@"status"] integerValue] : NSNotFound;
 
-        switch (status) {
-            case CargoBayStatusOK:
-            case CargoBayStatusReceiptValidButSubscriptionExpired: {
-                NSDictionary *receipt = [responseObject valueForKey:@"receipt"];
-                NSError *error = nil;
+            switch (status) {
+                case CargoBayStatusOK:
+                case CargoBayStatusReceiptValidButSubscriptionExpired: {
+                    NSDictionary *receipt = [responseObject valueForKey:@"receipt"];
+                    NSError *err = nil;
 
-                NSDictionary *purchaseInfo = CBPurchaseInfoFromTransactionReceipt(transactionReceipt, &error);
-                if (!purchaseInfo) {
-                    if (failure) {
-                        failure(error);
-                    }
-                    
-                    return;
-                }
-
-                BOOL isValid = CBValidatePurchaseInfoMatchesReceipt(purchaseInfo, receipt, &error);
-                if (!isValid) {
-                    if (failure) {
-                        failure(error);
-                    }
-                    
-                    return;
-                }
-                
-                // Every (re-)installation generates a new unique identifier for vendor.
-                // Every purchase and restoration receipt will be tagged with this new unique identifier.
-                // However, the latest receipt info might have a unique identifier for vendor from another device, from a previous installation, etc.
-                // Therefore, we should only check if the purchase info matches receipt for device for receipt we restored with this device.
-                isValid = CBValidatePurchaseInfoMatchesReceiptForDevice(purchaseInfo, receipt, &error);
-                if (!isValid) {
-                    if (failure) {
-                        failure(error);
-                    }
-                    
-                    return;
-                }
-
-                NSString *latestBase64EncodedTransactionReceipt = [responseObject valueForKey:@"latest_receipt"];
-                NSDictionary *latestReceipt = [responseObject valueForKey:@"latest_receipt_info"];
-                if ((latestBase64EncodedTransactionReceipt) && (latestReceipt)) {
-                    NSData *latestTransactionReceipt = CBDataFromBase64EncodedString(latestBase64EncodedTransactionReceipt);
-                    NSDictionary *latestPurchaseInfo = CBPurchaseInfoFromTransactionReceipt(latestTransactionReceipt, &error);
-                    if (!latestPurchaseInfo) {
+                    NSDictionary *purchaseInfo = CBPurchaseInfoFromTransactionReceipt(transactionReceipt, &err);
+                    if (!purchaseInfo) {
                         if (failure) {
-                            failure(error);
+                            failure(err);
                         }
                         
                         return;
                     }
 
-                    BOOL isLatestValid = CBValidatePurchaseInfoMatchesReceipt(latestPurchaseInfo, latestReceipt, &error);
-                    if (!isLatestValid) {
+                    BOOL isValid = CBValidatePurchaseInfoMatchesReceipt(purchaseInfo, receipt, &err);
+                    if (!isValid) {
                         if (failure) {
-                            failure(error);
+                            failure(err);
                         }
+                        
+                        return;
+                    }
+                    
+                    // Every (re-)installation generates a new unique identifier for vendor.
+                    // Every purchase and restoration receipt will be tagged with this new unique identifier.
+                    // However, the latest receipt info might have a unique identifier for vendor from another device, from a previous installation, etc.
+                    // Therefore, we should only check if the purchase info matches receipt for device for receipt we restored with this device.
+                    isValid = CBValidatePurchaseInfoMatchesReceiptForDevice(purchaseInfo, receipt, &err);
+                    if (!isValid) {
+                        if (failure) {
+                            failure(err);
+                        }
+                        
                         return;
                     }
 
-                    if (success) {
-                        success(responseObject);
-                    }
-                } else if ((latestBase64EncodedTransactionReceipt) || (latestReceipt)) {
-                    if (failure) {
-                        failure(error);
-                    }
-                } else {
-                    if (success) {
-                        success(responseObject);
-                    }
-                }
+                    NSString *latestBase64EncodedTransactionReceipt = [responseObject valueForKey:@"latest_receipt"];
+                    NSDictionary *latestReceipt = [responseObject valueForKey:@"latest_receipt_info"];
+                    if ((latestBase64EncodedTransactionReceipt) && (latestReceipt)) {
+                        NSData *latestTransactionReceipt = CBDataFromBase64EncodedString(latestBase64EncodedTransactionReceipt);
+                        NSDictionary *latestPurchaseInfo = CBPurchaseInfoFromTransactionReceipt(latestTransactionReceipt, &err);
+                        if (!latestPurchaseInfo) {
+                            if (failure) {
+                                failure(err);
+                            }
+                            
+                            return;
+                        }
 
-                break;
-            }
-            case CargoBayStatusSandboxReceiptSentToProduction:
-                [self verifyTransactionWithMethod:@"POST" endpoint:[NSURL URLWithString:kCargoBaySandboxReceiptVerificationURLString] receipt:transactionReceipt password:password success:success failure:failure];
-                break;
-            case CargoBayStatusProductionReceiptSentToSandbox:
-                [self verifyTransactionWithMethod:@"POST" endpoint:[NSURL URLWithString:kCargoBayProductionReceiptVerificationURLString] receipt:transactionReceipt password:password success:success failure:failure];
-                break;
-            default:
-                if (failure) {
-                    NSString *exception = [responseObject valueForKey:@"exception"];
-                    NSDictionary *userInfo = exception ? [NSDictionary dictionaryWithObject:exception forKey:NSLocalizedFailureReasonErrorKey] : nil;
-                    NSError *error = [[NSError alloc] initWithDomain:CargoBayErrorDomain code:status userInfo:userInfo];
-                    
-                    failure(error);
+                        BOOL isLatestValid = CBValidatePurchaseInfoMatchesReceipt(latestPurchaseInfo, latestReceipt, &err);
+                        if (!isLatestValid) {
+                            if (failure) {
+                                failure(err);
+                            }
+                            return;
+                        }
+
+                        if (success) {
+                            success(responseObject);
+                        }
+                    } else if ((latestBase64EncodedTransactionReceipt) || (latestReceipt)) {
+                        if (failure) {
+                            failure(err);
+                        }
+                    } else {
+                        if (success) {
+                            success(responseObject);
+                        }
+                    }
+
+                    break;
                 }
-                break;
-        }
-    } failure:^(__unused AFHTTPRequestOperation *operation, NSError *error) {
-        if (failure) {
-            failure(error);
+                case CargoBayStatusSandboxReceiptSentToProduction:
+                    [self verifyTransactionWithMethod:@"POST" endpoint:[NSURL URLWithString:kCargoBaySandboxReceiptVerificationURLString] receipt:transactionReceipt password:password success:success failure:failure];
+                    break;
+                case CargoBayStatusProductionReceiptSentToSandbox:
+                    [self verifyTransactionWithMethod:@"POST" endpoint:[NSURL URLWithString:kCargoBayProductionReceiptVerificationURLString] receipt:transactionReceipt password:password success:success failure:failure];
+                    break;
+                default:
+                    if (failure) {
+                        NSString *exception = [responseObject valueForKey:@"exception"];
+                        NSDictionary *userInfo = exception ? [NSDictionary dictionaryWithObject:exception forKey:NSLocalizedFailureReasonErrorKey] : nil;
+                        NSError *err = [[NSError alloc] initWithDomain:CargoBayErrorDomain code:status userInfo:userInfo];
+                        
+                        failure(err);
+                    }
+                    break;
+            }
         }
     }];
-
-    [requestOperation setWillSendRequestForAuthenticationChallengeBlock:^(__unused NSURLConnection *connection, NSURLAuthenticationChallenge *challenge) {
+    
+    [manager setAuthenticationChallengeHandler:^id _Nonnull(NSURLSession * _Nonnull session, NSURLSessionTask * _Nonnull task, NSURLAuthenticationChallenge * _Nonnull challenge, void (^ _Nonnull completionHandler)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable)) {
+        
         if ([[[challenge protectionSpace] authenticationMethod] isEqualToString:NSURLAuthenticationMethodServerTrust]) {
             SecTrustRef trust = [[challenge protectionSpace] serverTrust];
             NSError *error = nil;
@@ -916,18 +925,24 @@ NSDictionary * CBPurchaseInfoFromTransactionReceipt(NSData *transactionReceiptDa
                 if (credential) {
                     [[challenge sender] useCredential:credential forAuthenticationChallenge:challenge];
                     didUseCredential = YES;
+                    completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
                 }
             }
 
             if (!didUseCredential) {
                 [[challenge sender] cancelAuthenticationChallenge:challenge];
+                completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, [NSURLCredential credentialForTrust:trust]);
             }
         } else {
             [[challenge sender] performDefaultHandlingForAuthenticationChallenge:challenge];
+            completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, [NSURLCredential credentialForTrust:[[challenge protectionSpace] serverTrust]]);
         }
+        return nil;
     }];
 
-    [self.requestOperationQueue addOperation:requestOperation];
+    [self.requestOperationQueue addOperationWithBlock:^{
+        [task resume];
+    }];
 }
 
 - (void)setPaymentQueueUpdatedTransactionsBlock:(void (^)(SKPaymentQueue *queue, NSArray *transactions))block {

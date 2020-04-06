@@ -29,6 +29,9 @@
 #import "CargoBay.h"
 #import "AFNetworking.h"
 
+NSString * const kCargoBaySandboxReceiptVerificationURLString = @"https://sandbox.itunes.apple.com/verifyReceipt";
+NSString * const kCargoBayProductionReceiptVerificationURLString = @"https://buy.itunes.apple.com/verifyReceipt";
+
 @protocol _CargoBay <NSObject>
 @optional
 + (NSString *)_base64EncodedStringFromData:(NSData *)data;
@@ -49,8 +52,8 @@
 @end
 
 @interface CargoBay (Private) <_CargoBay>
-@property (readwrite, nonatomic, strong) AFHTTPRequestOperationManager *sandboxReceiptVerificationOperationManager;
-@property (readwrite, nonatomic, strong) AFHTTPRequestOperationManager *productionReceiptVerificationOperationManager;
+@property (readwrite, nonatomic, strong) AFHTTPSessionManager *sandboxReceiptVerificationOperationManager;
+@property (readwrite, nonatomic, strong) AFHTTPSessionManager *productionReceiptVerificationOperationManager;
 @end
 
 @implementation CargoBay (Private)
@@ -189,84 +192,101 @@ extern NSDictionary * CBPurchaseInfoFromTransactionReceipt(NSData *,  NSError * 
 - (void)testValidateTrust {
     // https://buy.itunes.apple.com/ have extended validation (EV) certificate.
     [self dispatchSemaphoreInBlock:^(void (^resume)(void)) {
-        AFHTTPRequestOperationManager *manager = [[AFHTTPRequestOperationManager alloc] initWithBaseURL:[NSURL URLWithString:@"https://buy.itunes.apple.com/"]];
+        AFHTTPSessionManager *manager = [[AFHTTPSessionManager alloc] initWithBaseURL:[NSURL URLWithString:@"https://buy.itunes.apple.com/"]];
         manager.requestSerializer  = [AFHTTPRequestSerializer  serializer];
         manager.responseSerializer = [AFHTTPResponseSerializer serializer];
         
         NSURL *url = [NSURL URLWithString:@"" relativeToURL:manager.baseURL];
         NSURLRequest *request = [manager.requestSerializer requestWithMethod:@"GET" URLString:url.absoluteString parameters:nil error:nil];
-        AFHTTPRequestOperation *requestOperation = [manager HTTPRequestOperationWithRequest:request success:^(__unused AFHTTPRequestOperation *operation, __unused id responseObject) {
-            resume();
-        } failure:^(__unused AFHTTPRequestOperation *operation, __unused NSError *error) {
-            XCTFail(@"The network operation should not fail.");
-            resume();
+        NSURLSessionDataTask* task = [manager dataTaskWithRequest:request uploadProgress:nil downloadProgress:nil completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable responseObject, NSError * _Nullable error) {
+            if (error) {
+                XCTFail(@"The network operation should not fail. %@", error.localizedDescription);
+                resume();
+            } else {
+                resume();
+            }
         }];
         
-        [requestOperation setWillSendRequestForAuthenticationChallengeBlock:^(__unused NSURLConnection *connection, NSURLAuthenticationChallenge *challenge) {
+        [manager setAuthenticationChallengeHandler:^id _Nonnull(NSURLSession * _Nonnull session, NSURLSessionTask * _Nonnull task, NSURLAuthenticationChallenge * _Nonnull challenge, void (^ _Nonnull completionHandler)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable)) {
+            
             if ([[[challenge protectionSpace] authenticationMethod] isEqualToString:NSURLAuthenticationMethodServerTrust]) {
                 SecTrustRef trust = [[challenge protectionSpace] serverTrust];
                 NSError *error = nil;
 
                 BOOL didUseCredential = NO;
                 BOOL isTrusted = [CargoBay _validateTrust:trust error:&error];
-                XCTAssertTrue(isTrusted, @"The result should be true.");
                 if (isTrusted) {
                     NSURLCredential *credential = [NSURLCredential credentialForTrust:trust];
                     if (credential) {
                         [[challenge sender] useCredential:credential forAuthenticationChallenge:challenge];
                         didUseCredential = YES;
+                        completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
                     }
                 }
 
                 if (!didUseCredential) {
                     [[challenge sender] cancelAuthenticationChallenge:challenge];
+                    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, [NSURLCredential credentialForTrust:trust]);
                 }
             } else {
                 [[challenge sender] performDefaultHandlingForAuthenticationChallenge:challenge];
+                completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, [NSURLCredential credentialForTrust:[[challenge protectionSpace] serverTrust]]);
             }
+            return nil;
         }];
         
-        [manager.operationQueue addOperation:requestOperation];
+        [manager.operationQueue addOperationWithBlock:^{
+            [task resume];
+        }];
     }];
     
     // https://www.apple.com/ does not have extended validation (EV) certificate.
     [self dispatchSemaphoreInBlock:^(void (^resume)(void)) {
-        AFHTTPRequestOperationManager *manager = [[AFHTTPRequestOperationManager alloc] initWithBaseURL:[NSURL URLWithString:@"https://www.apple.com/"]];
-        
+        AFHTTPSessionManager *manager = [[AFHTTPSessionManager alloc] initWithBaseURL:[NSURL URLWithString:@"https://www.apple.com/"]];
+        manager.responseSerializer = [AFHTTPResponseSerializer serializer];
         NSURL *url = [NSURL URLWithString:@"" relativeToURL:manager.baseURL];
         NSURLRequest *request = [manager.requestSerializer requestWithMethod:@"GET" URLString:url.absoluteString parameters:nil error:nil];
-        AFHTTPRequestOperation *requestOperation = [manager HTTPRequestOperationWithRequest:request success:^(__unused AFHTTPRequestOperation *operation, __unused id responseObject) {
-            XCTFail(@"The network operation should not be able to succeed.");
-            resume();
-        } failure:^(__unused AFHTTPRequestOperation *operation, __unused NSError *error) {
-            resume();
+        NSURLSessionDataTask* task = [manager dataTaskWithRequest:request uploadProgress:nil downloadProgress:nil completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable responseObject, NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"%@", error.localizedDescription);
+                XCTFail(@"The network operation should not fail. %@", error.localizedDescription);
+                resume();
+            } else {
+                resume();
+            }
         }];
         
-        [requestOperation setWillSendRequestForAuthenticationChallengeBlock:^(__unused NSURLConnection *connection, __unused NSURLAuthenticationChallenge *challenge) {
+        [manager setAuthenticationChallengeHandler:^id _Nonnull(NSURLSession * _Nonnull session, NSURLSessionTask * _Nonnull task, NSURLAuthenticationChallenge * _Nonnull challenge, void (^ _Nonnull completionHandler)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable)) {
+            
             if ([[[challenge protectionSpace] authenticationMethod] isEqualToString:NSURLAuthenticationMethodServerTrust]) {
                 SecTrustRef trust = [[challenge protectionSpace] serverTrust];
                 NSError *error = nil;
-                
+
                 BOOL didUseCredential = NO;
                 BOOL isTrusted = [CargoBay _validateTrust:trust error:&error];
-                XCTAssertTrue(isTrusted, @"The result should be true.");
                 if (isTrusted) {
                     NSURLCredential *credential = [NSURLCredential credentialForTrust:trust];
                     if (credential) {
                         [[challenge sender] useCredential:credential forAuthenticationChallenge:challenge];
                         didUseCredential = YES;
+                        completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
                     }
                 }
-                
+
                 if (!didUseCredential) {
                     [[challenge sender] cancelAuthenticationChallenge:challenge];
+                    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, [NSURLCredential credentialForTrust:trust]);
                 }
             } else {
                 [[challenge sender] performDefaultHandlingForAuthenticationChallenge:challenge];
+                completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, [NSURLCredential credentialForTrust:[[challenge protectionSpace] serverTrust]]);
             }
+            return nil;
         }];
         
-        [manager.operationQueue addOperation:requestOperation];
+        [manager.operationQueue addOperationWithBlock:^{
+            [task resume];
+        }];
     }];
 }
 
